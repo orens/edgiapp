@@ -1,11 +1,9 @@
 import json
-import time
 from functools import partial
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from threading import Condition, RLock
-from time import sleep
-from typing import cast, List
+from typing import cast, List, Callable
 
 from ExecutionSdk.execution import ExecutionSdk
 from ExecutionSdk.order import Order
@@ -16,7 +14,7 @@ PORT = 4444  # TODO
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))  # TODO error handling
-        order = Order(price = data['price'], order= data['order'])
+        order = Order(price=data['price'], order=data['order'])
         server = cast(AppServer, self.server)
         processor = server.add_order(order)
         response = processor()
@@ -47,7 +45,7 @@ class ExecutionBatch:
         self._orders.append(order)
         return next_index
 
-    def is_full(self):
+    def is_full(self) -> bool:
         return len(self._orders) >= self._batch_size
 
     def process_execution(self, for_index: int) -> Order:
@@ -79,9 +77,8 @@ class AppServer(ThreadingSimpleServer):
         self._curr_batch = ExecutionBatch(self.BATCH_SIZE)
         self._batch_lock = RLock()
 
-    def add_order(self, order: Order) -> (ExecutionBatch, int):  # TODO return partial callable?
+    def add_order(self, order: Order) -> Callable:
         """
-        :param order:
         :return: a callable object returning the execution result
         """
         with self._batch_lock:
