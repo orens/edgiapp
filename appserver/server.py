@@ -1,26 +1,38 @@
 import json
+import os
 from functools import partial
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from threading import Condition, RLock
-from typing import cast, List, Callable
+from typing import cast, List, Callable, Optional
 
 from ExecutionSdk.execution import ExecutionSdk
 from ExecutionSdk.order import Order
 
-PORT = 4444  # TODO
+PORT = os.environ.get('EDGIAPP_PORT', 4444)
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))  # TODO error handling
-        order = Order(price=data['price'], order=data['order'])
-        server = cast(AppServer, self.server)
-        processor = server.add_order(order)
-        response = processor()
-        print(response)
-        self.send_response(200)
-        self.end_headers()
+        try:
+            # noinspection PyBroadException
+            try:
+                data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                order = Order(price=data['price'], order=data['order'])
+                # would have verified values' types here, but the exercise did not specify any such constraints
+            except Exception:
+                self.send_error(400, "Request malformed")
+                return
+            server = cast(AppServer, self.server)
+            processor = server.add_order(order)
+            response = processor()
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(dict(status=response.status)).encode('utf-8'))
+        except Exception as reason:
+            self.log_error(f'Exception: {reason}')
+            self.send_error(500, 'Unexpected error')
 
 
 class ThreadingSimpleServer(ThreadingMixIn, HTTPServer):
@@ -28,19 +40,21 @@ class ThreadingSimpleServer(ThreadingMixIn, HTTPServer):
 
 
 class ExecutionBatch:
-    def __init__(self, batch_size):
+    def __init__(self, batch_size: int):
         self._batch_size = batch_size
-        self._cond = Condition()
+        self._condition = Condition()
         self._orders: List[Order] = []
         self._responses: List[Order] = []
-        self._is_pending = True
+        self._is_complete = False
+        self._exception_result: Optional[Exception] = None
 
     def add(self, order: Order) -> int:
         """
         :return: index of order in current batch
         NOTE: this method is single threaded
         """
-        assert self._is_pending, "Can't add an order for an already used batch"
+        assert not self._is_complete, "Can't add an order for an already used batch"
+        assert len(self._orders) < self._batch_size, "Unexpected state: too many orders for batch"
         next_index = len(self._orders)
         self._orders.append(order)
         return next_index
@@ -55,17 +69,23 @@ class ExecutionBatch:
         NOTE: this method may have a long wait, internally
         NOTE: two calls to this method should never have the same for_index for the same object
         """
-        print(f'process_execution: {for_index}')
-        with self._cond:
+        with self._condition:
             if for_index == self._batch_size - 1:
-                assert self._is_pending, "Can't add an order for an already used batch"
+                assert not self._is_complete, "Can't add an order for an already used batch"
                 assert self.is_full(), "Unexpected state: for_index incorrect "
-                self._responses = ExecutionSdk.execute_orders(self._orders)
-                self._is_pending = False
-                self._cond.notify_all()
+                try:
+                    self._responses = ExecutionSdk.execute_orders(self._orders)
+                except Exception as reason:
+                    self._exception_result = reason
+                    self._condition.notify_all()
+                    raise
+                self._is_complete = True
+                self._condition.notify_all()
                 return self._responses[for_index]
 
-            self._cond.wait_for(lambda: not self._is_pending)
+            self._condition.wait_for(lambda: self._is_complete or self._exception_result is not None)
+            if self._exception_result:
+                raise self._exception_result
             return self._responses[for_index]
 
 
@@ -90,7 +110,6 @@ class AppServer(ThreadingSimpleServer):
 
 
 def run():
-    print('run')
     server = AppServer(('0.0.0.0', PORT), Handler)
     server.serve_forever()
 
